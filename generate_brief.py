@@ -22,10 +22,12 @@ if _env_file.exists():
                 key, _, value = line.partition("=")
                 os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
 
+# Fierce Pharma を中心に取得（先頭のフィードから多く取得）
 RSS_FEEDS = [
-    ("https://www.biopharmadive.com/feeds/news/", "BioPharma Dive"),
-    ("https://www.fiercebiotech.com/rss/xml", "Fierce Biotech"),
-    ("https://endpoints.news/feed/", "Endpoints News"),
+    ("https://www.fiercepharma.com/rss/xml", "Fierce Pharma", 25),
+    ("https://www.fiercebiotech.com/rss/xml", "Fierce Biotech", 12),
+    ("https://endpoints.news/feed/", "Endpoints News", 12),
+    ("https://www.biopharmadive.com/feeds/news/", "BioPharma Dive", 10),
 ]
 
 CATEGORIES = ["pipeline", "regulatory", "deals", "earnings"]
@@ -33,12 +35,17 @@ REGIONS = ["US", "Europe", "China"]
 OUTPUT_FILE = Path(__file__).parent / "index.html"
 
 
-def fetch_articles(max_per_feed: int = 15) -> list[dict]:
-    """RSS から記事を取得"""
+def fetch_articles() -> list[dict]:
+    """RSS から記事を取得（Fierce Pharma を優先）"""
     articles = []
     seen_urls = set()
 
-    for url, source in RSS_FEEDS:
+    for item in RSS_FEEDS:
+        if len(item) == 3:
+            url, source, max_per_feed = item
+        else:
+            url, source = item[0], item[1]
+            max_per_feed = 10
         try:
             feed = feedparser.parse(url)
             for i, entry in enumerate(feed.entries):
@@ -92,7 +99,8 @@ def summarize_with_gemini(articles: list[dict]) -> list[dict] | None:
     )
 
     prompt = f"""以下の医薬・バイオ業界の英語ニュース記事一覧から、最も重要な記事を最大10本選び、
-日本語でサマリーを作成してください。
+**タイトルと要約は必ずすべて日本語で**書いてください。英語のままにしないこと。
+Fierce Pharma 由来の記事を優先して選んでください。
 
 【対象の重点】
 - 約9割は米国: FDA承認・申請、臨床試験、米国企業のM&A・決算
@@ -103,13 +111,14 @@ def summarize_with_gemini(articles: list[dict]) -> list[dict] | None:
 {article_text}
 
 【出力形式】以下のJSON形式のみで出力してください。他のテキストは含めないこと。
+title_ja と summary_ja は必ず日本語で記述すること。
 {{
   "articles": [
     {{
       "category": "pipeline|regulatory|deals|earnings",
       "region": "US|Europe|China",
-      "title_ja": "日本語タイトル",
-      "summary_ja": "2〜3文の日本語要約",
+      "title_ja": "日本語の記事タイトル（英語を翻訳・要約したもの）",
+      "summary_ja": "2〜3文の日本語要約（内容を日本語で説明）",
       "url": "元のURL",
       "source": "出典名",
       "entity": "企業名や組織名",
@@ -119,7 +128,7 @@ def summarize_with_gemini(articles: list[dict]) -> list[dict] | None:
   ]
 }}
 
-importance は 1(高)〜3(低)、category は pipeline=臨床・承認、regulatory=規制、deals=M&A・ライセンス、earnings=決算。
+importance は 1(高)〜3(低)。category は pipeline=臨床・承認、regulatory=規制、deals=M&A・ライセンス、earnings=決算。
 """
 
     try:
