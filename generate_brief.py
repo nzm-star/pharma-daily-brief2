@@ -7,7 +7,8 @@ import html
 import json
 import os
 import re
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import feedparser
@@ -35,10 +36,26 @@ REGIONS = ["US", "Europe", "China"]
 OUTPUT_FILE = Path(__file__).parent / "index.html"
 
 
-def fetch_articles() -> list[dict]:
-    """RSS から記事を取得（Fierce Pharma を優先）"""
+def _parse_entry_date(entry) -> datetime | None:
+    """RSS entry の日付をパース（直近24時間フィルタ用）"""
+    parsed = entry.get("published_parsed") or entry.get("updated_parsed")
+    if parsed:
+        return datetime.utcfromtimestamp(time.mktime(parsed))
+    pub = entry.get("published") or entry.get("updated")
+    if pub:
+        try:
+            from email.utils import parsedate_to_datetime
+            return parsedate_to_datetime(pub).replace(tzinfo=None)
+        except Exception:
+            pass
+    return None
+
+
+def fetch_articles(hours_back: int = 24) -> list[dict]:
+    """RSS から記事を取得（Fierce Pharma を優先、直近 hours_back 時間以内に限定）"""
     articles = []
     seen_urls = set()
+    cutoff = datetime.utcnow() - timedelta(hours=hours_back)
 
     for item in RSS_FEEDS:
         if len(item) == 3:
@@ -53,6 +70,9 @@ def fetch_articles() -> list[dict]:
                     break
                 link = entry.get("link", "").strip()
                 if not link or link in seen_urls:
+                    continue
+                pub_dt = _parse_entry_date(entry)
+                if pub_dt and pub_dt < cutoff:
                     continue
                 seen_urls.add(link)
 
@@ -98,55 +118,137 @@ def summarize_with_gemini(articles: list[dict]) -> list[dict] | None:
         for i, a in enumerate(articles[:40])
     )
 
-    prompt = f"""以下の医薬・バイオ業界の英語ニュース記事一覧から、最も重要な記事を最大10本選び、
-**タイトルと要約は必ずすべて日本語で**書いてください。英語のままにしないこと。
-Fierce Pharma 由来の記事を優先して選んでください。
+    prompt = f"""You are a pharma/biotech news analyst. Select up to 10 most important articles from the list below.
+For each article, you MUST provide:
+- title_ja: Japanese translation of the title (NOT English)
+- summary_ja: 2-3 sentence summary IN JAPANESE (NOT English)
+- category: one of pipeline, regulatory, deals, earnings
+- region: US, Europe, or China
+- importance: 1 (highest) to 3 (lowest) - vary by significance
 
-【対象の重点】
-- 約9割は米国: FDA承認・申請、臨床試験、米国企業のM&A・決算
-- 欧州: ノボノルディスク、BMS、サノフィ、ロッシュ、バイエルなど大手の重要ニュース
-- 中国: 個別企業よりNMPAなど医薬品規制当局の大きな動向
+Prioritize Fierce Pharma articles. pipeline=clinical/FDA, regulatory=FDA/agencies, deals=M&A/licensing, earnings=financial results.
 
-【記事一覧】
-{article_text}
-
-【出力形式】以下のJSON形式のみで出力してください。他のテキストは含めないこと。
-title_ja と summary_ja は必ず日本語で記述すること。
+Output ONLY valid JSON, no markdown:
 {{
   "articles": [
     {{
-      "category": "pipeline|regulatory|deals|earnings",
-      "region": "US|Europe|China",
-      "title_ja": "日本語の記事タイトル（英語を翻訳・要約したもの）",
-      "summary_ja": "2〜3文の日本語要約（内容を日本語で説明）",
-      "url": "元のURL",
-      "source": "出典名",
-      "entity": "企業名や組織名",
-      "tag": "FDA承認やM&Aなどの短いタグ",
+      "category": "pipeline",
+      "region": "US",
+      "title_ja": "日本語タイトル",
+      "summary_ja": "日本語で2〜3文の要約",
+      "url": "exact URL from input",
+      "source": "source name",
+      "entity": "company name",
+      "tag": "short tag",
       "importance": 1
     }}
   ]
 }}
 
-importance は 1(高)〜3(低)。category は pipeline=臨床・承認、regulatory=規制、deals=M&A・ライセンス、earnings=決算。
+Article list:
+{article_text}
 """
 
     try:
         response = model.generate_content(prompt)
         text = response.text.strip()
-        # JSON ブロックを抽出（```で囲まれている場合）
         if "```" in text:
-            text = re.sub(r"^```(?:json)?\s*", "", text)
-            text = re.sub(r"\s*```$", "", text)
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
+            if m:
+                text = m.group(1).strip()
+            else:
+                text = re.sub(r"^```(?:json)?\s*", "", text)
+                text = re.sub(r"\s*```$", "", text)
         data = json.loads(text)
-        return data.get("articles", [])[:10]
+        raw = data.get("articles", [])[:10]
+        return [_normalize_article(a) for a in raw]
     except Exception as e:
         print(f"Gemini API error: {e}")
         return None
 
 
+def _normalize_article(a: dict) -> dict:
+    """Gemini の戻り値を正規化（キー名のゆらぎに対応）"""
+    url = a.get("url") or ""
+    source = a.get("source") or ""
+    title_ja = a.get("title_ja") or a.get("title") or ""
+    summary_ja = a.get("summary_ja") or a.get("summary") or a.get("description") or ""
+    cat = (a.get("category") or "pipeline").lower()
+    if cat not in ("pipeline", "regulatory", "deals", "earnings"):
+        cat = "pipeline"
+    region = a.get("region") or "US"
+    if str(region).lower() not in ("us", "europe", "china"):
+        region = "US"
+    imp = a.get("importance")
+    try:
+        imp = min(3, max(1, int(imp)))
+    except (TypeError, ValueError):
+        imp = 2
+    return {
+        "category": cat,
+        "region": region,
+        "title_ja": str(title_ja).strip(),
+        "summary_ja": str(summary_ja).strip(),
+        "url": url,
+        "source": source,
+        "entity": a.get("entity") or "",
+        "tag": a.get("tag") or "",
+        "importance": imp,
+    }
+
+
+def _translate_with_gemini(articles: list[dict]) -> list[dict] | None:
+    """フォールバック用: 英語記事を日本語に翻訳・分類"""
+    api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
+    if not api_key:
+        return None
+    try:
+        import google.generativeai as genai
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            "gemini-1.5-flash",
+            generation_config={"response_mime_type": "application/json"},
+        )
+    except ImportError:
+        return None
+
+    items = articles[:10]
+    text = "\n".join(
+        f"[{i+1}] URL: {a['url']}\nTitle: {a['title']}\nDesc: {a['description'][:120]}...\nSource: {a['source']}"
+        for i, a in enumerate(items)
+    )
+    prompt = f"""Translate these pharma articles to Japanese. Output JSON only.
+Each output must include the exact "url" from input (copy verbatim). title_ja and summary_ja in Japanese.
+Assign category/region/importance. Format: {{"articles":[{{"url":"...","title_ja":"...","summary_ja":"...","source":"...","category":"pipeline","region":"US","entity":"","tag":"","importance":2}}]}}
+
+{text}
+"""
+    try:
+        resp = model.generate_content(prompt)
+        t = resp.text.strip()
+        if "```" in t:
+            m = re.search(r"```(?:json)?\s*([\s\S]*?)```", t)
+            t = m.group(1).strip() if m else re.sub(r"^```.*\n?", "", t)
+        data = json.loads(t)
+        raw = data.get("articles", [])[:10]
+        out = []
+        for i, a in enumerate(raw):
+            norm = _normalize_article(a)
+            if not norm.get("url") and i < len(items):
+                norm["url"] = items[i]["url"]
+                norm["source"] = norm.get("source") or items[i]["source"]
+            out.append(norm)
+        return out
+    except Exception as e:
+        print(f"Translate fallback error: {e}")
+        return None
+
+
 def build_fallback_articles(articles: list[dict]) -> list[dict]:
-    """Gemini 失敗時のフォールバック: RSS の上位10本をそのまま使用"""
+    """Gemini 失敗時のフォールバック: 翻訳を試み、失敗時は英語のまま"""
+    translated = _translate_with_gemini(articles)
+    if translated:
+        return translated
     result = []
     for a in articles[:10]:
         result.append({
@@ -215,10 +317,12 @@ def render_html(articles: list[dict]) -> str:
                 meta_parts.append(f'<span>{esc(a["tag"])}</span>')
             meta_parts.append(f'<span class="importance">{star_html(imp)}</span>')
 
+            title_display = (a.get("title_ja") or a.get("title") or "Untitled").strip()
+            summary_display = (a.get("summary_ja") or a.get("summary") or "").strip()
             cards_html.append(f'''
       <article class="article-card {cat}">
-        <h3 class="title"><a href="{esc(a["url"])}" target="_blank" rel="noopener">{esc(a["title_ja"])}</a></h3>
-        <p class="summary">{esc(a["summary_ja"])}</p>
+        <h3 class="title"><a href="{esc(a["url"])}" target="_blank" rel="noopener">{esc(title_display)}</a></h3>
+        <p class="summary">{esc(summary_display)}</p>
         <div class="meta">
           {" ".join(meta_parts)}
         </div>
