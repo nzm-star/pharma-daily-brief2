@@ -2,8 +2,8 @@ name: Pharma Daily Brief
 
 on:
   schedule:
-    # 毎朝 7:00 JST = 22:00 UTC（前日）
-    - cron: '0 22 * * *'
+    # 毎朝 5:00 SGT（シンガポール）= 21:00 UTC（前日）
+    - cron: '0 21 * * *'
   workflow_dispatch:
 
 jobs:
